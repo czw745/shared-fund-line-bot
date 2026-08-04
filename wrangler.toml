@@ -1,0 +1,17 @@
+name = "shared-fund-line-bot"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "shared-fund-ledger"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["10 16 1 * *", "0 1 1,3 * *"]
+
+[vars]
+TIME_ZONE = "Asia/Taipei"
+GEMINI_DAILY_LIMIT = "100"
+LINE_PUSH_MONTHLY_LIMIT = "200"
