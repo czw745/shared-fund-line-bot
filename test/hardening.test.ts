@@ -32,4 +32,29 @@ describe("privacy and accounting hardening", () => {
     await worker.fetch(await signedLineRequest("晚餐300", { eventId: "resumed" }), providers.env);
     expect(providers.geminiInputs).toEqual(["晚餐300"]);
   });
+
+  it("retries an AI failure without posting twice", async () => {
+    const store = new MemoryStore();
+    const providers = new TestProviders();
+    providers.parseFailures = 1;
+    providers.parses.push({ intent: "transactions", transactions: [{ type: "expense", amount: 300, date: "2026-08-04", majorCategory: "飲食", smallCategory: "正餐", note: "晚餐" }] });
+    const worker = createWorker({ store, providers });
+    await worker.fetch(await signedLineRequest("晚餐300", { eventId: "ai-failed" }), providers.env);
+    const retryId = providers.replies.at(-1)?.text.match(/重試 ([\w-]+)/)?.[1];
+    expect(retryId).toBeTruthy();
+
+    await worker.fetch(await signedLineRequest(`重試 ${retryId}`, { eventId: "ai-retry" }), providers.env);
+    await worker.fetch(await signedLineRequest("餘額", { eventId: "ai-retry-balance" }), providers.env);
+    expect(providers.replies.at(-1)?.text).toContain("-NT$300");
+  });
+
+  it("never confirms an invalid high-value candidate", async () => {
+    const store = new MemoryStore();
+    const providers = new TestProviders();
+    providers.parses.push({ intent: "transactions", transactions: [{ type: "expense", amount: -12000, date: "2026-08-04", majorCategory: "購物", smallCategory: "家電" }] });
+    const worker = createWorker({ store, providers });
+    await worker.fetch(await signedLineRequest("家電負一萬二", { eventId: "invalid-high" }), providers.env);
+    expect(providers.replies.at(-1)?.text).toContain("無效");
+    expect(providers.replies.at(-1)?.text).not.toContain("確認 ");
+  });
 });

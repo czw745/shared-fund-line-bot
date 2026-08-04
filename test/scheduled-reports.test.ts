@@ -37,7 +37,7 @@ describe("month close and reports", () => {
 
     expect(providers.charts).toHaveLength(1);
     expect(providers.charts[0]?.data.datasets[0]?.values).toEqual([300, 0, 0, 0, 0]);
-    expect(providers.replies.at(-1)?.text).toContain("https://worker.test/charts/");
+    expect(JSON.stringify(providers.replies.at(-1)?.flex)).toContain("https://worker.test/charts/");
   });
 
   it("requires same-sender confirmation before changing a closed month", async () => {

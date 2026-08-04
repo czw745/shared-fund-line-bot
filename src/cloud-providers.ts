@@ -4,7 +4,7 @@ import type { ChartData, CloudEnv, ParseContext, ParseResult, Providers, ReplyMe
 
 function lineMessage(message: ReplyMessage): Record<string, unknown> {
   if (!message.flex) return { type: "text", text: message.text };
-  const suppliedContents = message.flex.type === "bubble" && message.flex.body ? message.flex : undefined;
+  const suppliedContents = (message.flex.type === "bubble" || message.flex.type === "carousel") ? message.flex : undefined;
   return {
     type: "flex",
     altText: message.text.slice(0, 400),

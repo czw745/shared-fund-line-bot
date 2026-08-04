@@ -36,13 +36,14 @@ export class MemoryStore implements Store {
     const previous = this.locks.get(groupId) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => { release = resolve; });
-    this.locks.set(groupId, previous.then(() => current));
+    const chained = previous.then(() => current);
+    this.locks.set(groupId, chained);
     await previous;
     try {
       return await action();
     } finally {
       release();
-      if (this.locks.get(groupId) === current) this.locks.delete(groupId);
+      if (this.locks.get(groupId) === chained) this.locks.delete(groupId);
     }
   }
 }
@@ -64,6 +65,7 @@ export class TestProviders implements Providers {
   readonly uploads: Array<{ month: string; csv: string; existingFileId?: string }> = [];
   readonly charts: Array<{ kind: string; data: ChartData }> = [];
   allowance = 200;
+  parseFailures = 0;
 
   async reply(token: string, message: ReplyMessage): Promise<void> {
     this.replies.push({ ...message, token });
@@ -76,6 +78,10 @@ export class TestProviders implements Providers {
 
   async parse(text: string, _context: ParseContext): Promise<ParseResult> {
     this.geminiInputs.push(text);
+    if (this.parseFailures > 0) {
+      this.parseFailures -= 1;
+      throw new Error("Gemini unavailable");
+    }
     return this.parses.shift() ?? { intent: "unknown" };
   }
 

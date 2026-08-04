@@ -107,7 +107,7 @@ export interface LedgerEntry extends ParsedTransaction {
 
 export interface PendingOperation {
   id: string;
-  kind: "candidate" | "edit" | "closed_month" | "contribution_choice" | "retry";
+  kind: "candidate" | "edit" | "refund" | "closed_month" | "contribution_choice" | "retry";
   actorId: string;
   groupId: string;
   expiresAt: number;
