@@ -10,10 +10,6 @@ export interface AppEnv {
   CHART_SIGNING_SECRET?: string;
   PUBLIC_BASE_URL?: string;
   GEMINI_MODEL?: string;
-  GOOGLE_CLIENT_ID?: string;
-  GOOGLE_CLIENT_SECRET?: string;
-  GOOGLE_REFRESH_TOKEN?: string;
-  GOOGLE_DRIVE_FOLDER_ID?: string;
 }
 
 export interface LineSource {
@@ -48,14 +44,16 @@ export interface LineWebhook {
 export interface ReplyMessage {
   text: string;
   flex?: Record<string, unknown>;
+  /** Internal delivery metadata; CloudProviders never sends this field to LINE. */
+  pendingEventIds?: string[];
 }
 
 export interface Providers {
   env: AppEnv;
   reply(token: string, message: ReplyMessage): Promise<void>;
   push(groupId: string, message: ReplyMessage): Promise<void>;
+  memberName(groupId: string, userId: string): Promise<string | undefined>;
   parse(text: string, context: ParseContext): Promise<ParseResult>;
-  uploadCsv(month: string, csv: string, existingFileId?: string): Promise<string>;
   chart(kind: "month" | "monthly-trend" | "category-trend", data: ChartData): Promise<string>;
   pushAllowance(): Promise<number>;
   serveChart(request: Request): Promise<Response>;
@@ -71,6 +69,7 @@ export interface ChartData {
   summary: string[];
 }
 
+/** `refund` is retained only for reading historical ledger entries; new refunds are rejected. */
 export type TransactionType = "expense" | "contribution" | "topup" | "refund" | "income";
 
 export interface ParsedTransaction {
@@ -107,7 +106,7 @@ export interface LedgerEntry extends ParsedTransaction {
 
 export interface PendingOperation {
   id: string;
-  kind: "candidate" | "edit" | "refund" | "closed_month" | "contribution_choice" | "retry";
+  kind: "candidate" | "edit" | "closed_month" | "contribution_choice" | "retry";
   actorId: string;
   groupId: string;
   expiresAt: number;
@@ -138,11 +137,10 @@ export interface GroupState {
   thresholdBands: Record<string, number>;
   suspended: boolean;
   outsiderIds: string[];
+  memberNames: Record<string, string>;
   geminiUsage: Record<string, number>;
   sentJobs: string[];
   pendingReceipts: ReplyMessage[];
-  driveFiles: Record<string, string>;
-  driveFailures: string[];
 }
 
 export interface EventRecord {
@@ -153,11 +151,20 @@ export interface EventRecord {
   status: "received" | "processing" | "posted" | "failed_retryable" | "failed_final" | "reply_pending";
   raw?: string;
   expiresAt?: number;
+  errorCode?: string;
+}
+
+export interface ErrorSummary {
+  total: number;
+  byCode: Record<string, number>;
 }
 
 export interface Store {
   beginEvent(record: EventRecord): Promise<boolean>;
-  finishEvent(id: string, status: EventRecord["status"]): Promise<void>;
+  finishEvent(id: string, status: EventRecord["status"], errorCode?: string): Promise<void>;
+  errorSummary(groupId: string, sinceTimestamp: number): Promise<ErrorSummary>;
+  saveCsvExport(token: string, csv: string, filename: string, expiresAt: number): Promise<void>;
+  loadCsvExport(token: string): Promise<{ csv: string; filename: string; expiresAt: number } | undefined>;
   loadState(groupId: string): Promise<GroupState>;
   saveState(state: GroupState): Promise<void>;
   cleanup(beforeTimestamp: number): Promise<void>;
@@ -165,6 +172,6 @@ export interface Store {
 }
 
 export interface WorkerApp {
-  fetch(request: Request, env: AppEnv): Promise<Response>;
+  fetch(request: Request, env: AppEnv, context?: Pick<ExecutionContext, "waitUntil">): Promise<Response>;
   scheduled?(event: ScheduledEvent, env: AppEnv): Promise<void>;
 }

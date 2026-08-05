@@ -1,5 +1,5 @@
 import { emptyState } from "./domain";
-import type { EventRecord, GroupState, Store } from "./types";
+import type { ErrorSummary, EventRecord, GroupState, Store } from "./types";
 
 export class D1Store implements Store {
   constructor(private readonly db: D1Database) {}
@@ -13,8 +13,32 @@ export class D1Store implements Store {
     return (result.meta.changes ?? 0) === 1;
   }
 
-  async finishEvent(id: string, status: EventRecord["status"]): Promise<void> {
-    await this.db.prepare("UPDATE webhook_events SET status = ?, updated_at = ? WHERE id = ?").bind(status, Date.now(), id).run();
+  async finishEvent(id: string, status: EventRecord["status"], errorCode?: string): Promise<void> {
+    await this.db.prepare("UPDATE webhook_events SET status = ?, error_code = ?, updated_at = ? WHERE id = ?").bind(status, errorCode ?? null, Date.now(), id).run();
+  }
+
+  async errorSummary(groupId: string, sinceTimestamp: number): Promise<ErrorSummary> {
+    const result = await this.db.prepare(
+      `SELECT error_code, COUNT(*) AS count
+       FROM webhook_events
+       WHERE group_id = ? AND event_timestamp >= ?
+         AND status IN ('failed_retryable', 'reply_pending')
+         AND error_code IS NOT NULL
+       GROUP BY error_code`,
+    ).bind(groupId, sinceTimestamp).all<{ error_code: string; count: number }>();
+    const byCode = Object.fromEntries(result.results.map((row) => [row.error_code, Number(row.count)]));
+    return { total: Object.values(byCode).reduce((sum, count) => sum + count, 0), byCode };
+  }
+
+  async saveCsvExport(token: string, csv: string, filename: string, expiresAt: number): Promise<void> {
+    await this.db.prepare("INSERT INTO csv_exports (token, csv_text, filename, expires_at) VALUES (?, ?, ?, ?)")
+      .bind(token, csv, filename, expiresAt).run();
+  }
+
+  async loadCsvExport(token: string): Promise<{ csv: string; filename: string; expiresAt: number } | undefined> {
+    const row = await this.db.prepare("SELECT csv_text, filename, expires_at FROM csv_exports WHERE token = ?")
+      .bind(token).first<{ csv_text: string; filename: string; expires_at: number }>();
+    return row ? { csv: row.csv_text, filename: row.filename, expiresAt: row.expires_at } : undefined;
   }
 
   async loadState(groupId: string): Promise<GroupState> {
@@ -33,13 +57,14 @@ export class D1Store implements Store {
     await this.db.batch([
       this.db.prepare("DELETE FROM webhook_events WHERE expires_at IS NOT NULL AND expires_at < ?").bind(beforeTimestamp),
       this.db.prepare("DELETE FROM chart_tokens WHERE expires_at < ?").bind(beforeTimestamp),
+      this.db.prepare("DELETE FROM csv_exports WHERE expires_at < ?").bind(beforeTimestamp),
     ]);
   }
 
   async withGroupLock<T>(groupId: string, action: () => Promise<T>): Promise<T> {
     const owner = crypto.randomUUID();
     let acquired = false;
-    for (let attempt = 0; attempt < 40 && !acquired; attempt += 1) {
+    for (let attempt = 0; attempt < 200 && !acquired; attempt += 1) {
       const now = Date.now();
       const result = await this.db.prepare(
         `INSERT INTO group_locks (group_id, owner, expires_at) VALUES (?, ?, ?)

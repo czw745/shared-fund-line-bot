@@ -1,16 +1,97 @@
-import { validLineSignature } from "./security";
+import { lineSignature, validLineSignature } from "./security";
 import { activeEntries, addEntry, balance, CATEGORIES, eventDate, money, monthOf, monthState, openingBalance, signedAmount, validTransaction } from "./domain";
-import type { AppEnv, GroupState, LineEvent, LineWebhook, ParsedTransaction, Providers, ReplyMessage, Store, WorkerApp } from "./types";
+import type { AppEnv, GroupState, LineEvent, LineWebhook, ParsedTransaction, ParseResult, PendingOperation, Providers, ReplyMessage, Store, WorkerApp } from "./types";
 
-const HELP = [
-  "共同基金可用指令：",
-  "餘額｜最近紀錄｜修改｜本月明細",
-  "本月分析｜每月趨勢｜分類趨勢｜說明",
-  "目前只支援文字記帳。",
-].join("\n");
+type PreparedParse = { kind: "result"; result: ParseResult } | { kind: "failure" } | { kind: "quota" };
+
+const DIRECT_COMMANDS = new Set(["說明", "圖表", "明細", "系統狀態", "餘額", "最近紀錄", "修改", "本月明細", "下載 CSV", "本月分析", "每月趨勢", "分類趨勢"]);
+const LOCK_FREE_COMMANDS = new Set(DIRECT_COMMANDS);
+
+function needsGemini(text: string): boolean {
+  if (DIRECT_COMMANDS.has(text)) return false;
+  return ![/^重試 [\w-]+$/, /^取消 [\w-]+$/, /^編輯 [\w-]+$/, /^分類 [\w-]+ .+$/, /^存入選擇 [\w-]+ (?:修改原申報|額外補入)$/, /^確認 [\w-]+$/, /^刪除 [\w-]+$/].some((pattern) => pattern.test(text));
+}
+
+async function prepareParse(text: string, state: GroupState, timestamp: number, providers: Providers, env: AppEnv): Promise<PreparedParse> {
+  const date = eventDate(timestamp);
+  if ((state.geminiUsage[date] ?? 0) >= Number(env.GEMINI_DAILY_LIMIT)) return { kind: "quota" };
+  try {
+    return { kind: "result", result: await providers.parse(text, { eventDate: date, categories: CATEGORIES }) };
+  } catch {
+    return { kind: "failure" };
+  }
+}
+
+function classifyError(error: unknown): string {
+  if (!(error instanceof Error)) return "internal_error";
+  if (error.message === "Group is busy") return "group_lock_timeout";
+  if (error.name === "AbortError" || error.name === "TimeoutError") return "external_timeout";
+  if (error.message.includes("Provider request failed: 429")) return "provider_rate_limited";
+  if (error.message.includes("Provider request failed:")) return "provider_error";
+  return "internal_error";
+}
+
+function attachPendingReceipts(response: ReplyMessage | undefined, state: GroupState): ReplyMessage | undefined {
+  state.pendingReceipts ??= [];
+  if (!response || state.pendingReceipts.length === 0) return response;
+  response.text = `${state.pendingReceipts.map((item) => item.text).join("\n---\n")}\n---\n${response.text}`;
+  response.pendingEventIds = [...new Set(state.pendingReceipts.flatMap((item) => item.pendingEventIds ?? []))];
+  state.pendingReceipts = [];
+  return response;
+}
 
 function allowedUsers(env: AppEnv): Set<string> {
   return new Set(env.ALLOWED_USER_IDS.split(",").map((value) => value.trim()).filter(Boolean));
+}
+
+function transactionTypeLabel(type: string): string {
+  const labels: Record<string, string> = { expense: "支出", contribution: "存入", topup: "補入", refund: "退款", income: "收入" };
+  return labels[type] ?? type;
+}
+
+function transactionSummary(entry: ReturnType<typeof activeEntries>[number], state: GroupState): string {
+  const category = entry.majorCategory ? ` ${entry.majorCategory}／${entry.smallCategory}` : "";
+  const recorder = state.memberNames?.[entry.actorId] ?? "成員";
+  return `#${entry.sequence} ${entry.date} ${transactionTypeLabel(entry.type)} ${money(entry.amount)}${category}${entry.note ? `｜${entry.note}` : ""}｜記錄者：${recorder}`;
+}
+
+function transactionProposalSummary(transaction: ParsedTransaction): string {
+  const category = transaction.majorCategory ? ` ${transaction.majorCategory}／${transaction.smallCategory ?? "分類待選"}` : "";
+  return `${transaction.date} ${transactionTypeLabel(transaction.type)} ${money(transaction.amount)}${category}${transaction.note ? `｜${transaction.note}` : ""}`;
+}
+
+function transactionCopyText(entry: ReturnType<typeof activeEntries>[number]): string {
+  const month = Number(entry.date.slice(5, 7));
+  const day = Number(entry.date.slice(8, 10));
+  const description = [...new Set([entry.smallCategory, entry.note].filter((value): value is string => Boolean(value)))].join(" ") || transactionTypeLabel(entry.type);
+  return `${month}/${day} ${description} ${entry.amount}`;
+}
+
+function candidateReply(pending: PendingOperation, state: GroupState): ReplyMessage {
+  const target = pending.targetId
+    ? activeEntries(state).find((entry) => entry.id === pending.targetId && entry.actorId === pending.actorId)
+    : undefined;
+  const isEdit = pending.operation === "replace" && Boolean(target);
+  const transactions = pending.transactions ?? [];
+  const preview = isEdit && target
+    ? `修改前：${transactionSummary(target, state)}\n修改後：${transactions.map(transactionProposalSummary).join("\n")}`
+    : `待入帳：${transactions.map(transactionProposalSummary).join("\n")}`;
+  const choices = pending.choices?.length ? `\n分類選擇：${pending.choices.join("、")}` : "";
+  const buttons = [
+    ...(pending.choices ?? []).slice(0, 3).map((choice) => ({
+      type: "button",
+      action: { type: "postback", label: choice, data: `action=category&id=${pending.id}&value=${encodeURIComponent(choice)}`, displayText: `選擇分類：${choice}` },
+    })),
+    { type: "button", action: { type: "postback", label: isEdit ? "確認修改" : "確認入帳", data: `action=confirm&id=${pending.id}`, displayText: isEdit && target ? `確認修改 #${target.sequence}` : "確認入帳" } },
+    { type: "button", action: { type: "postback", label: isEdit ? "取消修改" : "取消入帳", data: `action=cancel&id=${pending.id}`, displayText: isEdit && target ? `取消修改 #${target.sequence}` : "取消入帳" } },
+  ];
+  return {
+    text: `${preview}${choices}`,
+    flex: {
+      type: "bubble",
+      body: { type: "box", layout: "vertical", contents: [{ type: "text", text: preview, wrap: true }, ...buttons] },
+    },
+  };
 }
 
 function authorized(event: LineEvent, env: AppEnv): event is LineEvent & { source: { groupId: string; userId: string; type: "group" } } {
@@ -24,15 +105,44 @@ function authorized(event: LineEvent, env: AppEnv): event is LineEvent & { sourc
   );
 }
 
+async function cacheMemberNames(state: GroupState, groupId: string, env: AppEnv, providers: Providers): Promise<void> {
+  state.memberNames ??= {};
+  await Promise.all([...allowedUsers(env)].map(async (userId) => {
+    if (state.memberNames[userId]) return;
+    try {
+      const displayName = await providers.memberName(groupId, userId);
+      if (displayName) state.memberNames[userId] = displayName;
+    } catch {
+      // Profile lookup must never prevent accounting; a later event will retry.
+    }
+  }));
+}
+
 function receipt(transactions: ParsedTransaction[], state: GroupState, alert?: string): ReplyMessage {
   const lines = transactions.map((transaction) => {
     const category = transaction.majorCategory ? ` ${transaction.majorCategory}／${transaction.smallCategory}` : "";
-    return `${transaction.date} ${transaction.type === "expense" ? "支出" : "存入"} ${money(transaction.amount)}${category}${transaction.note ? `｜${transaction.note}` : ""}`;
+    return `${transaction.date} ${transactionTypeLabel(transaction.type)} ${money(transaction.amount)}${category}${transaction.note ? `｜${transaction.note}` : ""}`;
   });
   const currentMonth = monthState(state, monthOf(transactions[0]?.date ?? eventDate(Date.now())));
-  const label = currentMonth.status === "active" ? "目前餘額" : "暫估餘額";
+  const label = currentMonth.status === "active" ? "餘額" : "餘額（本月存入未完成）";
   const text = `${lines.join("\n")}\n${label}：${money(balance(state))}${alert ? `\n${alert}` : ""}`;
-  return { text, flex: { type: "bubble", altText: text } };
+  const contents: Array<Record<string, unknown>> = lines.map((line) => ({ type: "text", text: line, wrap: true, size: "sm" }));
+  contents.push(
+    { type: "separator", margin: "md" },
+    { type: "text", text: `${label}：${money(balance(state))}`, wrap: true, weight: "bold", margin: "md" },
+  );
+  if (alert) contents.push({ type: "text", text: alert, wrap: true, color: "#D32F2F", margin: "sm" });
+  return {
+    text,
+    flex: {
+      type: "bubble",
+      body: {
+        type: "box",
+        layout: "vertical",
+        contents,
+      },
+    },
+  };
 }
 
 function balanceBand(value: number): number {
@@ -65,10 +175,13 @@ function voidEntry(state: GroupState, target: ReturnType<typeof activeEntries>[n
   }
 }
 
-function balanceReply(state: GroupState, timestamp: number): ReplyMessage {
+function balanceReply(state: GroupState, timestamp: number, actorId: string, env: AppEnv): ReplyMessage {
   const month = monthState(state, monthOf(eventDate(timestamp)));
-  const label = month.status === "active" ? "目前餘額" : "暫估餘額";
-  const statuses = Object.entries(month.confirmations).map(([user, confirmation]) => `${user}:${money(confirmation.amount)}`).join("、") || "兩人皆未確認存入";
+  const label = month.status === "active" ? "餘額" : "餘額（本月存入未完成）";
+  const users = [...allowedUsers(env)];
+  const status = (userId: string | undefined): string => userId && month.confirmations[userId] ? money(month.confirmations[userId].amount) : "未確認";
+  const otherId = users.find((userId) => userId !== actorId);
+  const statuses = `你：${status(actorId)}、另一位：${status(otherId)}`;
   return { text: `${label}：${money(balance(state))}\n本月存入：${statuses}` };
 }
 
@@ -82,19 +195,38 @@ function categoryTotals(state: GroupState, month: string): number[] {
   return [...totals.values()];
 }
 
+function categoryRankingReply(title: string, subtitle: string | undefined, labels: string[], values: number[]): ReplyMessage {
+  const total = values.reduce((sum, value) => sum + value, 0);
+  const rows = labels
+    .map((label, index) => ({ label, value: values[index] ?? 0 }))
+    .filter((row) => row.value > 0)
+    .sort((left, right) => right.value - left.value);
+  if (rows.length === 0) return { text: `${title}\n本月尚無支出資料。` };
+  const lines = rows.map((row) => `${row.label}：${money(row.value)}（${Math.round(row.value / total * 100)}%）`);
+  const contents: Array<Record<string, unknown>> = [
+    { type: "text", text: title, weight: "bold", size: "lg" },
+    ...(subtitle ? [{ type: "text", text: subtitle, wrap: true, size: "sm", color: "#777777", margin: "sm" }] : []),
+    { type: "separator", margin: "md" },
+  ];
+  for (const row of rows) {
+    contents.push({
+      type: "box", layout: "horizontal", margin: "md", contents: [
+        { type: "text", text: row.label, flex: 2, size: "md" },
+        { type: "text", text: money(row.value), flex: 3, size: "md", weight: "bold", align: "end" },
+        { type: "text", text: `${Math.round(row.value / total * 100)}%`, flex: 1, size: "sm", color: "#777777", align: "end" },
+      ],
+    });
+  }
+  contents.push({ type: "separator", margin: "md" }, { type: "text", text: `合計：${money(total)}`, weight: "bold", margin: "md" });
+  return { text: [title, ...(subtitle ? [subtitle] : []), ...lines, `合計：${money(total)}`].join("\n"), flex: { type: "bubble", body: { type: "box", layout: "vertical", contents } } };
+}
+
 async function chartReply(command: string, state: GroupState, timestamp: number, providers: Providers): Promise<ReplyMessage> {
   const current = monthOf(eventDate(timestamp));
   if (command === "本月分析") {
     const labels = Object.keys(CATEGORIES);
     const values = categoryTotals(state, current);
-    const total = values.reduce((sum, value) => sum + value, 0);
-    const summary = [`本月淨支出 ${money(total)}`];
-    try {
-      const url = await providers.chart("month", { labels, datasets: [{ label: "淨支出", values }], summary });
-      return { text: summary.join("\n"), flex: chartFlex(url, summary) };
-    } catch {
-      return { text: `${summary.join("\n")}\n圖表暫時無法產生。` };
-    }
+    return categoryRankingReply("本月分類排行", undefined, labels, values);
   }
   const cursor = new Date(`${current}-01T00:00:00+08:00`);
   const months: string[] = [];
@@ -107,18 +239,36 @@ async function chartReply(command: string, state: GroupState, timestamp: number,
     const contributions = months.map((month) => activeEntries(state).filter((entry) => monthOf(entry.date) === month && ["contribution", "topup", "income"].includes(entry.type)).reduce((sum, entry) => sum + entry.amount, 0));
     const expenses = months.map((month) => categoryTotals(state, month).reduce((sum, value) => sum + value, 0));
     const closings = months.map((month) => state.months[month]?.closingBalance ?? balance(state, `${month}-31`));
-    const summary = [`最近 ${months.length} 個月支出 ${money(expenses.reduce((sum, value) => sum + value, 0))}`];
+    const activeIndexes = months.flatMap((_, index) => contributions[index] || expenses[index] ? [index] : []);
+    if (activeIndexes.length < 2) {
+      const index = activeIndexes[0];
+      const detail = index === undefined ? "目前尚無月份資料。" : `${months[index]}：存入 ${money(contributions[index] ?? 0)}、支出 ${money(expenses[index] ?? 0)}、餘額 ${money(closings[index] ?? 0)}`;
+      return { text: `每月趨勢\n${detail}\n累積至少 2 個月後顯示趨勢圖。` };
+    }
+    const activeMonths = activeIndexes.map((index) => months[index] ?? "");
+    const activeContributions = activeIndexes.map((index) => contributions[index] ?? 0);
+    const activeExpenses = activeIndexes.map((index) => expenses[index] ?? 0);
+    const activeClosings = activeIndexes.map((index) => closings[index] ?? 0);
+    const summary = [`最近 ${activeMonths.length} 個有效月份支出 ${money(activeExpenses.reduce((sum, value) => sum + value, 0))}`];
     try {
-      const url = await providers.chart("monthly-trend", { labels: months, datasets: [{ label: "存入", values: contributions }, { label: "支出", values: expenses }, { label: "月底結餘", values: closings }], summary });
+      const url = await providers.chart("monthly-trend", { labels: activeMonths, datasets: [{ label: "存入", values: activeContributions }, { label: "支出", values: activeExpenses }, { label: "月底結餘", values: activeClosings }], summary });
       return { text: summary.join("\n"), flex: chartFlex(url, summary) };
     } catch {
       return { text: `${summary.join("\n")}\n圖表暫時無法產生。` };
     }
   }
-  const datasets = Object.keys(CATEGORIES).map((category, index) => ({ label: category, values: months.map((month) => categoryTotals(state, month)[index] ?? 0) }));
-  const summary = ["最近六個月分類趨勢"];
+  const categoryValues = months.map((month) => categoryTotals(state, month));
+  const activeIndexes = months.flatMap((_, index) => categoryValues[index]?.some((value) => value > 0) ? [index] : []);
+  if (activeIndexes.length < 2) {
+    return categoryRankingReply("分類趨勢", "目前只有 1 個有效月份；累積至少 2 個月後顯示趨勢圖。", Object.keys(CATEGORIES), categoryValues[activeIndexes[0] ?? months.length - 1] ?? []);
+  }
+  const activeMonths = activeIndexes.map((index) => months[index] ?? "");
+  const datasets = Object.keys(CATEGORIES)
+    .map((category, categoryIndex) => ({ label: category, values: activeIndexes.map((monthIndex) => categoryValues[monthIndex]?.[categoryIndex] ?? 0) }))
+    .filter((dataset) => dataset.values.some((value) => value > 0));
+  const summary = [`最近 ${activeMonths.length} 個有效月份分類趨勢`];
   try {
-    const url = await providers.chart("category-trend", { labels: months, datasets, summary });
+    const url = await providers.chart("category-trend", { labels: activeMonths, datasets, summary });
     return { text: summary.join("\n"), flex: chartFlex(url, summary) };
   } catch {
     return { text: `${summary.join("\n")}\n圖表暫時無法產生。` };
@@ -128,43 +278,165 @@ async function chartReply(command: string, state: GroupState, timestamp: number,
 function chartFlex(url: string, summary: string[]): Record<string, unknown> {
   return {
     type: "bubble",
-    hero: { type: "image", url, size: "full", aspectRatio: "3:2", aspectMode: "fit" },
+    hero: { type: "image", url, size: "full", aspectRatio: "4:5", aspectMode: "fit" },
     body: { type: "box", layout: "vertical", contents: summary.map((text) => ({ type: "text", text, wrap: true, size: "sm" })) },
+  };
+}
+
+function chartMenuReply(): ReplyMessage {
+  const commands = ["本月分析", "每月趨勢", "分類趨勢"];
+  return {
+    text: "請選擇圖表功能：本月分析、每月趨勢、分類趨勢。",
+    flex: {
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical", contents: [
+          { type: "text", text: "圖表", weight: "bold", size: "xl" },
+          { type: "text", text: "請選擇要查看的分析", color: "#777777", size: "sm", margin: "sm" },
+          { type: "separator", margin: "md" },
+          ...commands.map((command) => ({ type: "button", margin: "sm", action: { type: "postback", label: command, data: `action=chart&value=${encodeURIComponent(command)}`, displayText: command } })),
+        ],
+      },
+    },
+  };
+}
+
+function detailMenuReply(): ReplyMessage {
+  const commands = [
+    { label: "最近紀錄", command: "最近紀錄" },
+    { label: "本月明細", command: "本月明細" },
+    { label: "下載 CSV", command: "下載 CSV" },
+    { label: "修改交易", command: "修改" },
+  ];
+  return {
+    text: "請選擇明細功能：最近紀錄、本月明細、修改交易。",
+    flex: {
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical", contents: [
+          { type: "text", text: "明細", weight: "bold", size: "xl" },
+          { type: "text", text: "請選擇要查看或管理的內容", color: "#777777", size: "sm", margin: "sm" },
+          { type: "separator", margin: "md" },
+          ...commands.map(({ label, command }) => ({ type: "button", margin: "sm", action: { type: "postback", label, data: `action=detail&value=${encodeURIComponent(command)}`, displayText: label } })),
+        ],
+      },
+    },
+  };
+}
+
+function mainMenuReply(): ReplyMessage {
+  const commands = ["餘額", "明細", "圖表", "系統狀態"];
+  return {
+    text: "請選擇功能：餘額、明細、圖表、系統狀態。",
+    flex: {
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical", contents: [
+          { type: "text", text: "共同基金", weight: "bold", size: "xl" },
+          { type: "text", text: "請選擇要使用的功能", color: "#777777", size: "sm", margin: "sm" },
+          { type: "separator", margin: "md" },
+          ...commands.map((command) => ({ type: "button", margin: "sm", action: { type: "postback", label: command, data: `action=menu&value=${encodeURIComponent(command)}`, displayText: command } })),
+        ],
+      },
+    },
+  };
+}
+
+const ERROR_LABELS: Record<string, string> = {
+  line_reply_failed: "LINE 回覆失敗",
+  group_lock_timeout: "處理佇列逾時",
+  external_timeout: "外部服務逾時",
+  provider_rate_limited: "外部服務額度限制",
+  provider_error: "外部服務失敗",
+  internal_error: "系統處理失敗",
+};
+
+async function systemStatusReply(state: GroupState, timestamp: number, providers: Providers, env: AppEnv, store: Store): Promise<ReplyMessage> {
+  const geminiLimit = Number(env.GEMINI_DAILY_LIMIT);
+  const geminiUsed = state.geminiUsage[eventDate(timestamp)] ?? 0;
+  let lineStatus = "LINE Push 本月：暫時無法取得。";
+  try {
+    const lineLimit = Number(env.LINE_PUSH_MONTHLY_LIMIT);
+    const lineRemaining = await providers.pushAllowance();
+    lineStatus = `LINE Push 本月：已用 ${Math.max(0, lineLimit - lineRemaining)}、剩餘 ${lineRemaining} / ${lineLimit} 則`;
+  } catch {
+    // Gemini usage remains available when LINE quota lookup fails.
+  }
+  const geminiStatus = `Gemini 今日：${geminiUsed} / ${geminiLimit} 次`;
+  let healthStatus = "最近 24 小時：暫時無法取得。";
+  try {
+    const errors = await store.errorSummary(state.groupId, timestamp - 24 * 60 * 60 * 1000);
+    healthStatus = errors.total === 0
+      ? "最近 24 小時：運作正常"
+      : `最近 24 小時：${errors.total} 筆異常（${Object.entries(errors.byCode).map(([code, count]) => `${ERROR_LABELS[code] ?? "其他錯誤"} ${count}`).join("、")}）`;
+  } catch {
+    // Provider quota status remains available when D1 health lookup fails.
+  }
+  return {
+    text: `${geminiStatus}\n${lineStatus}\n${healthStatus}`,
+    flex: {
+      type: "bubble",
+      body: { type: "box", layout: "vertical", contents: [
+        { type: "text", text: "系統狀態", weight: "bold", size: "xl" },
+        { type: "separator", margin: "md" },
+        { type: "text", text: geminiStatus, wrap: true, margin: "md" },
+        { type: "text", text: lineStatus, wrap: true, margin: "md" },
+        { type: "text", text: healthStatus, wrap: true, margin: "md" },
+      ] },
+    },
   };
 }
 
 function csvForMonth(state: GroupState, month: string): string {
   const quote = (value: unknown) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-  const header = ["日期", "類型", "金額", "大分類", "小分類", "備註", "建立者", "輸入原文", "建立時間", "狀態", "關聯交易"];
-  const rows = state.ledger.filter((entry) => monthOf(entry.date) === month).map((entry) => [entry.date, entry.type, entry.amount, entry.majorCategory, entry.smallCategory, entry.note, entry.actorId, entry.originalText, new Date(entry.createdAt).toISOString(), entry.status, entry.linkedTransactionId ?? entry.revisionOf]);
+  const header = ["日期", "類型", "金額", "大分類", "小分類", "備註", "建立者名稱", "建立者ID", "輸入原文", "建立時間", "狀態", "關聯交易"];
+  const rows = state.ledger.filter((entry) => monthOf(entry.date) === month).map((entry) => [entry.date, entry.type, entry.amount, entry.majorCategory, entry.smallCategory, entry.note, state.memberNames?.[entry.actorId] ?? "成員", entry.actorId, entry.originalText, new Date(entry.createdAt).toISOString(), entry.status, entry.linkedTransactionId ?? entry.revisionOf]);
   return `\uFEFF${[header, ...rows].map((row) => row.map(quote).join(",")).join("\r\n")}`;
 }
 
-async function uploadCsvWithRetry(providers: Providers, month: string, csv: string, existingFileId?: string): Promise<string> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      return await providers.uploadCsv(month, csv, existingFileId);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError;
+async function csvDownloadReply(state: GroupState, timestamp: number, store: Store, env: AppEnv): Promise<ReplyMessage> {
+  if (!env.PUBLIC_BASE_URL || !env.CHART_SIGNING_SECRET) return { text: "CSV 下載尚未完成系統設定。" };
+  const month = monthOf(eventDate(timestamp));
+  const token = crypto.randomUUID();
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+  const filename = `共同基金_${month}.csv`;
+  await store.saveCsvExport(token, csvForMonth(state, month), filename, expiresAt);
+  const signature = await lineSignature(env.CHART_SIGNING_SECRET, `csv.${token}.${expiresAt}`);
+  const url = `${env.PUBLIC_BASE_URL.replace(/\/$/, "")}/exports/${encodeURIComponent(token)}?expires=${expiresAt}&signature=${encodeURIComponent(signature)}`;
+  return {
+    text: `${month} CSV 已產生，下載連結 10 分鐘內有效。\n${url}`,
+    flex: { type: "bubble", body: { type: "box", layout: "vertical", contents: [
+      { type: "text", text: `${month} 帳本 CSV`, weight: "bold", size: "xl" },
+      { type: "text", text: "下載連結 10 分鐘內有效", color: "#777777", size: "sm", margin: "sm" },
+      { type: "button", margin: "md", action: { type: "uri", label: "下載 CSV", uri: url } },
+    ] } },
+  };
 }
 
-async function recomputeClosedMonths(state: GroupState, fromMonth: string, providers: Providers): Promise<void> {
+async function serveCsvExport(request: Request, store: Store, env: AppEnv): Promise<Response> {
+  const url = new URL(request.url);
+  const token = url.pathname.split("/").at(-1) ?? "";
+  const expiresAt = Number(url.searchParams.get("expires"));
+  const signature = url.searchParams.get("signature") ?? "";
+  if (!env.CHART_SIGNING_SECRET || !token || !Number.isFinite(expiresAt) || expiresAt < Date.now()) return new Response("Not found", { status: 404 });
+  const expected = await lineSignature(env.CHART_SIGNING_SECRET, `csv.${token}.${expiresAt}`);
+  if (expected !== signature) return new Response("Not found", { status: 404 });
+  const item = await store.loadCsvExport(token);
+  if (!item || item.expiresAt !== expiresAt || item.expiresAt < Date.now()) return new Response("Not found", { status: 404 });
+  return new Response(item.csv, { headers: {
+    "content-type": "text/csv; charset=utf-8",
+    "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(item.filename)}`,
+    "cache-control": "private, no-store",
+  } });
+}
+
+async function recomputeClosedMonths(state: GroupState, fromMonth: string): Promise<void> {
   for (const month of Object.keys(state.months).filter((candidate) => candidate >= fromMonth).sort()) {
     const fundMonth = state.months[month];
     if (!fundMonth) continue;
     fundMonth.openingBalance = openingBalance(state, month);
     if (fundMonth.status === "closed") {
       fundMonth.closingBalance = balance(state, `${month}-31`);
-      try {
-        state.driveFiles[month] = await uploadCsvWithRetry(providers, month, csvForMonth(state, month), state.driveFiles[month]);
-        state.driveFailures = state.driveFailures.filter((candidate) => candidate !== month);
-      } catch {
-        if (!state.driveFailures.includes(month)) state.driveFailures.push(month);
-      }
     }
   }
 }
@@ -182,23 +454,28 @@ async function processText(
   state: GroupState,
   providers: Providers,
   env: AppEnv,
+  store: Store,
+  preparedParse?: PreparedParse,
 ): Promise<ReplyMessage | undefined> {
-  if (text === "說明") return { text: HELP };
-  if (text === "餘額") return balanceReply(state, event.timestamp);
+  if (text === "說明") return mainMenuReply();
+  if (text === "圖表") return chartMenuReply();
+  if (text === "明細") return detailMenuReply();
+  if (text === "系統狀態") return systemStatusReply(state, event.timestamp, providers, env, store);
+  if (text === "餘額") return balanceReply(state, event.timestamp, event.source.userId, env);
   if (text === "最近紀錄" || text === "修改") {
     const entries = activeEntries(state)
       .filter((entry) => text === "最近紀錄" || entry.actorId === event.source.userId)
       .sort((left, right) => right.sequence - left.sequence)
       .slice(0, 10);
     if (entries.length === 0) return { text: "目前沒有交易紀錄。" };
-    const output = entries.map((entry) => `#${entry.sequence} ${entry.date} ${money(entry.amount)} ${entry.note ?? ""} ID:${entry.id}`).join("\n");
+    const output = entries.map((entry) => transactionSummary(entry, state)).join("\n");
     const bubbles = text === "修改" ? entries.map((entry) => ({
       type: "bubble",
       body: { type: "box", layout: "vertical", contents: [
-        { type: "text", text: `#${entry.sequence} ${entry.date} ${money(entry.amount)}`, wrap: true },
-        { type: "button", action: { type: "postback", label: "編輯", data: `action=edit&id=${entry.id}`, displayText: `編輯 ${entry.id}` } },
-        { type: "button", action: { type: "postback", label: "刪除", data: `action=delete&id=${entry.id}`, displayText: `刪除 ${entry.id}` } },
-        ...(entry.type === "expense" ? [{ type: "button", action: { type: "postback", label: "退款", data: `action=refund&id=${entry.id}`, displayText: `準備退款 ${entry.id}` } }] : []),
+        { type: "text", text: transactionSummary(entry, state), wrap: true },
+        { type: "button", action: { type: "postback", label: "編輯", data: `action=edit&id=${entry.id}`, displayText: `編輯 #${entry.sequence}` } },
+        { type: "button", action: { type: "clipboard", label: "複製內容", clipboardText: transactionCopyText(entry) } },
+        { type: "button", action: { type: "postback", label: "刪除", data: `action=delete&id=${entry.id}`, displayText: `刪除 #${entry.sequence}` } },
       ] },
     })) : [];
     return { text: output, ...(bubbles.length ? { flex: { type: "carousel", contents: bubbles } } : {}) };
@@ -207,26 +484,23 @@ async function processText(
     const month = monthOf(eventDate(event.timestamp));
     const entries = activeEntries(state).filter((entry) => monthOf(entry.date) === month);
     const total = entries.filter((entry) => entry.type === "expense").reduce((sum, entry) => sum + entry.amount, 0);
-    return { text: `${month} 共 ${entries.length} 筆，本月支出 ${money(total)}\n${entries.map((entry) => `#${entry.sequence} ${entry.note ?? entry.type} ${money(entry.amount)}`).join("\n")}` };
+    return { text: `${month} 共 ${entries.length} 筆，本月支出 ${money(total)}\n${entries.map((entry) => transactionSummary(entry, state)).join("\n")}` };
   }
+  if (text === "下載 CSV") return csvDownloadReply(state, event.timestamp, store, env);
   if (["本月分析", "每月趨勢", "分類趨勢"].includes(text)) return chartReply(text, state, event.timestamp, providers);
   const retryId = text.match(/^重試 ([\w-]+)$/)?.[1];
   if (retryId) {
     const pending = state.pending.find((item) => item.id === retryId && item.kind === "retry" && item.actorId === event.source.userId && item.expiresAt >= event.timestamp);
     if (!pending) return { text: "重試已失效或不屬於你。" };
     state.pending = state.pending.filter((item) => item.id !== pending.id);
-    return processText(event, pending.originalText, state, providers, env);
+    return processText(event, pending.originalText, state, providers, env, store);
   }
-  if (text === "重新上傳") {
-    const month = [...state.driveFailures].sort().at(-1);
-    if (!month) return { text: "目前沒有待重新上傳的 CSV。" };
-    try {
-      state.driveFiles[month] = await uploadCsvWithRetry(providers, month, csvForMonth(state, month), state.driveFiles[month]);
-      state.driveFailures = state.driveFailures.filter((candidate) => candidate !== month);
-      return { text: `${month} CSV 已重新上傳。` };
-    } catch {
-      return { text: `${month} CSV 仍無法上傳，帳務資料不受影響。` };
-    }
+  const cancelId = text.match(/^取消 ([\w-]+)$/)?.[1];
+  if (cancelId) {
+    const pending = state.pending.find((item) => item.id === cancelId && item.actorId === event.source.userId && item.groupId === event.source.groupId && item.expiresAt >= event.timestamp);
+    if (!pending) return { text: "取消已失效或不屬於你。" };
+    state.pending = state.pending.filter((item) => item.id !== pending.id);
+    return { text: pending.operation === "replace" ? "已取消修改，原交易保持不變。" : "已取消入帳。" };
   }
   const editId = text.match(/^編輯 ([\w-]+)$/)?.[1];
   if (editId) {
@@ -235,13 +509,6 @@ async function processText(
     state.pending.push({ id: crypto.randomUUID(), kind: "edit", actorId: event.source.userId, groupId: event.source.groupId, expiresAt: event.timestamp + 600_000, originalText: text, targetId: target.id });
     return { text: `請在 10 分鐘內重新描述完整交易 #${target.sequence}。` };
   }
-  const refundSetupId = text.match(/^退款準備 ([\w-]+)$/)?.[1];
-  if (refundSetupId) {
-    const target = activeEntries(state).find((entry) => entry.id === refundSetupId && entry.actorId === event.source.userId && entry.type === "expense");
-    if (!target) return { text: "找不到你可退款的交易。" };
-    state.pending.push({ id: crypto.randomUUID(), kind: "refund", actorId: event.source.userId, groupId: event.source.groupId, expiresAt: event.timestamp + 600_000, originalText: text, targetId: target.id });
-    return { text: `請輸入「退款 ${target.id} 金額」，例如：退款 ${target.id} 300。` };
-  }
   const categoryMatch = text.match(/^分類 ([\w-]+) (.+)$/);
   if (categoryMatch) {
     const selectedSmallCategory = categoryMatch[2] ?? "";
@@ -249,7 +516,8 @@ async function processText(
     const category = Object.entries(CATEGORIES).find(([, values]) => values.includes(selectedSmallCategory as never));
     if (!pending?.transactions || !category) return { text: "分類選擇已失效或不正確。" };
     pending.transactions = pending.transactions.map((transaction) => ({ ...transaction, majorCategory: category[0], smallCategory: selectedSmallCategory }));
-    return { text: `已選擇 ${category[0]}／${selectedSmallCategory}。\n確認 ${pending.id}` };
+    delete pending.choices;
+    return candidateReply(pending, state);
   }
   const contributionChoice = text.match(/^存入選擇 ([\w-]+) (修改原申報|額外補入)$/);
   if (contributionChoice) {
@@ -278,26 +546,20 @@ async function processText(
     if (pending.targetId && !target) return { text: "原交易已不存在，未變更。" };
     if ((pending.transactions ?? []).some((transaction) => !validTransaction(transaction, eventDate(event.timestamp)))) return { text: "候選交易仍有無效欄位，未入帳。" };
     if (target && (pending.operation === "void" || pending.operation === "replace")) voidEntry(state, target, { id: event.webhookEventId, timestamp: event.timestamp, originalText: pending.originalText });
-    for (const transaction of pending.transactions ?? []) addEntry(state, transaction, { actorId: event.source.userId, originalText: pending.originalText, eventId: event.webhookEventId, now: event.timestamp });
+    for (const transaction of pending.transactions ?? []) {
+      const entry = addEntry(state, transaction, { actorId: event.source.userId, originalText: pending.originalText, eventId: event.webhookEventId, now: event.timestamp });
+      if (transaction.type === "contribution") {
+        const fundMonth = monthState(state, monthOf(transaction.date));
+        fundMonth.confirmations[event.source.userId] = { amount: transaction.amount, entryId: entry.id };
+        if (fundMonth.status !== "closed" && [...allowedUsers(env)].every((userId) => fundMonth.confirmations[userId])) {
+          fundMonth.status = "active";
+          state.thresholdBands[fundMonth.month] = balanceBand(balance(state));
+        }
+      }
+    }
     state.pending = state.pending.filter((item) => item.id !== pending.id);
-    if (pending.kind === "closed_month") await recomputeClosedMonths(state, pending.effectiveMonth ?? monthOf(pending.transactions?.[0]?.date ?? target?.date ?? eventDate(event.timestamp)), providers);
+    if (pending.kind === "closed_month") await recomputeClosedMonths(state, pending.effectiveMonth ?? monthOf(pending.transactions?.[0]?.date ?? target?.date ?? eventDate(event.timestamp)));
     return pending.transactions?.length ? receipt(pending.transactions, state) : { text: `已作廢交易，目前餘額：${money(balance(state))}` };
-  }
-  const refundMatch = text.match(/^退款 ([\w-]+) (\d+)$/);
-  if (refundMatch) {
-    const target = activeEntries(state).find((entry) => entry.id === refundMatch[1] && entry.actorId === event.source.userId && entry.type === "expense");
-    const amount = Number(refundMatch[2]);
-    if (!target || !Number.isInteger(amount) || amount <= 0) return { text: "找不到可退款的交易。" };
-    const refunded = activeEntries(state).filter((entry) => entry.type === "refund" && entry.linkedTransactionId === target.id).reduce((sum, entry) => sum + entry.amount, 0);
-    if (refunded + amount > target.amount) return { text: "退款累計不可超過原支出。" };
-    const transaction: ParsedTransaction = {
-      type: "refund", amount, date: eventDate(event.timestamp), linkedTransactionId: target.id,
-      ...(target.majorCategory ? { majorCategory: target.majorCategory } : {}),
-      ...(target.smallCategory ? { smallCategory: target.smallCategory } : {}),
-      ...(target.note ? { note: target.note } : {}),
-    };
-    addEntry(state, transaction, { actorId: event.source.userId, originalText: text, eventId: event.webhookEventId, now: event.timestamp });
-    return receipt([transaction], state);
   }
   const deleteId = text.match(/^刪除 ([\w-]+)$/)?.[1];
   if (deleteId) {
@@ -314,15 +576,23 @@ async function processText(
   const date = eventDate(event.timestamp);
   const usageDay = date;
   const used = state.geminiUsage[usageDay] ?? 0;
-  if (used >= Number(env.GEMINI_DAILY_LIMIT)) return { text: "今日 AI 免費額度已用完；精確查詢指令仍可使用。" };
+  if (preparedParse?.kind === "quota" || used >= Number(env.GEMINI_DAILY_LIMIT)) return { text: "今日 AI 免費額度已用完；精確查詢指令仍可使用。" };
   state.geminiUsage[usageDay] = used + 1;
   let parsed;
-  try {
-    parsed = await providers.parse(text, { eventDate: date, categories: CATEGORIES });
-  } catch {
+  if (preparedParse?.kind === "failure") {
     const id = crypto.randomUUID();
     state.pending.push({ id, kind: "retry", actorId: event.source.userId, groupId: event.source.groupId, expiresAt: event.timestamp + 600_000, originalText: text });
     return { text: `暫時無法解析，尚未入帳。\n重試 ${id}` };
+  } else if (preparedParse?.kind === "result") {
+    parsed = preparedParse.result;
+  } else {
+    try {
+      parsed = await providers.parse(text, { eventDate: date, categories: CATEGORIES });
+    } catch {
+      const id = crypto.randomUUID();
+      state.pending.push({ id, kind: "retry", actorId: event.source.userId, groupId: event.source.groupId, expiresAt: event.timestamp + 600_000, originalText: text });
+      return { text: `暫時無法解析，尚未入帳。\n重試 ${id}` };
+    }
   }
   if (parsed.intent === "zero_contribution") {
     const month = monthState(state, monthOf(date));
@@ -331,12 +601,12 @@ async function processText(
       month.status = "active";
       state.thresholdBands[month.month] = balanceBand(balance(state));
     }
-    return balanceReply(state, event.timestamp);
+    return balanceReply(state, event.timestamp, event.source.userId, env);
   }
   if (parsed.intent === "query") {
-    if (parsed.query === "balance") return balanceReply(state, event.timestamp);
-    if (parsed.query === "recent") return processText(event, "最近紀錄", state, providers, env);
-    if (parsed.query === "month_detail") return processText(event, "本月明細", state, providers, env);
+    if (parsed.query === "balance") return balanceReply(state, event.timestamp, event.source.userId, env);
+    if (parsed.query === "recent") return processText(event, "最近紀錄", state, providers, env, store);
+    if (parsed.query === "month_detail") return processText(event, "本月明細", state, providers, env, store);
     return { text: "無法判斷你想查詢的內容。" };
   }
   if (parsed.intent !== "transactions" || parsed.transactions.length === 0) return { text: "無法判斷為可入帳內容，尚未入帳。" };
@@ -346,17 +616,13 @@ async function processText(
   if (parsed.ambiguous || parsed.transactions.some((transaction) => transaction.amount >= 10_000)) {
     const id = crypto.randomUUID();
     if (pendingEditForCandidate) state.pending = state.pending.filter((item) => item.id !== pendingEditForCandidate.id);
-    state.pending.push({
+    const pending: PendingOperation = {
       id, kind: "candidate", actorId: event.source.userId, groupId: event.source.groupId, expiresAt: event.timestamp + 600_000, originalText: text, transactions: parsed.transactions,
       ...(parsed.categoryChoices ? { choices: parsed.categoryChoices } : {}),
       ...(pendingEditForCandidate?.targetId ? { targetId: pendingEditForCandidate.targetId, operation: "replace" as const } : {}),
-    });
-    const choices = parsed.categoryChoices?.length ? `\n分類選擇：${parsed.categoryChoices.join("、")}` : "";
-    const buttons = [
-      { type: "button", action: { type: "postback", label: "確認入帳", data: `action=confirm&id=${id}`, displayText: `確認 ${id}` } },
-      ...(parsed.categoryChoices ?? []).slice(0, 3).map((choice) => ({ type: "button", action: { type: "postback", label: choice, data: `action=category&id=${id}&value=${encodeURIComponent(choice)}`, displayText: `分類 ${id} ${choice}` } })),
-    ];
-    return { text: `此交易需要確認後才會入帳。${choices}\n確認 ${id}`, flex: { type: "bubble", body: { type: "box", layout: "vertical", contents: buttons } } };
+    };
+    state.pending.push(pending);
+    return candidateReply(pending, state);
   }
   if (parsed.transactions.some((transaction) => !validTransaction(transaction, date))) return { text: "交易欄位不完整或無效，尚未入帳。" };
   const pendingEdit = state.pending.find((item) => item.kind === "edit" && item.actorId === event.source.userId && item.expiresAt >= event.timestamp);
@@ -369,10 +635,28 @@ async function processText(
       state.pending.push({ id, kind: "closed_month", operation: "replace", actorId: event.source.userId, groupId: event.source.groupId, expiresAt: event.timestamp + 300_000, originalText: text, targetId: target.id, transactions: parsed.transactions, effectiveMonth: monthOf(target.date) });
       return { text: `這會修改已關帳月份 ${monthOf(target.date)} 並重算結轉。\n確認 ${id}` };
     }
-    voidEntry(state, target, { id: event.webhookEventId, timestamp: event.timestamp, originalText: text });
-    const replacements = parsed.transactions.map((transaction) => addEntry(state, transaction, { actorId: event.source.userId, originalText: text, eventId: event.webhookEventId, now: event.timestamp }));
+    const id = crypto.randomUUID();
     state.pending = state.pending.filter((item) => item.id !== pendingEdit.id);
-    return receipt(replacements, state);
+    state.pending.push({
+      id,
+      kind: "candidate",
+      operation: "replace",
+      actorId: event.source.userId,
+      groupId: event.source.groupId,
+      expiresAt: event.timestamp + 600_000,
+      originalText: text,
+      targetId: target.id,
+      transactions: parsed.transactions,
+    });
+    const preview = `修改前：${transactionSummary(target, state)}\n修改後：${parsed.transactions.map(transactionProposalSummary).join("\n")}`;
+    const buttons = [
+      { type: "button", action: { type: "postback", label: "確認修改", data: `action=confirm&id=${id}`, displayText: `確認修改 #${target.sequence}` } },
+      { type: "button", action: { type: "postback", label: "取消修改", data: `action=cancel&id=${id}`, displayText: `取消修改 #${target.sequence}` } },
+    ];
+    return {
+      text: preview,
+      flex: { type: "bubble", body: { type: "box", layout: "vertical", contents: [{ type: "text", text: preview, wrap: true }, ...buttons] } },
+    };
   }
   const closedMonth = parsed.transactions.find((transaction) => state.months[monthOf(transaction.date)]?.status === "closed");
   if (closedMonth) {
@@ -408,8 +692,9 @@ async function processText(
 export function createWorker(dependencies: { store: Store; providers: Providers }): WorkerApp {
   const { store, providers } = dependencies;
   return {
-    async fetch(request, env) {
+    async fetch(request, env, context) {
       if (request.method === "GET" && new URL(request.url).pathname.startsWith("/charts/")) return providers.serveChart(request);
+      if (request.method === "GET" && new URL(request.url).pathname.startsWith("/exports/")) return serveCsvExport(request, store, env);
       if (request.method !== "POST") return new Response("Not found", { status: 404 });
       const body = await request.text();
       if (!(await validLineSignature(env.LINE_CHANNEL_SECRET, body, request.headers.get("x-line-signature")))) {
@@ -421,6 +706,51 @@ export function createWorker(dependencies: { store: Store; providers: Providers 
       } catch {
         return new Response("Invalid payload", { status: 400 });
       }
+      const deliverReply = async (
+        event: LineEvent & { source: { groupId: string; userId: string; type: "group" } },
+        response: ReplyMessage,
+      ): Promise<void> => {
+        try {
+          await providers.reply(event.replyToken ?? "", response);
+          await store.finishEvent(event.webhookEventId, "posted");
+          for (const recoveredEventId of response.pendingEventIds ?? []) {
+            if (recoveredEventId !== event.webhookEventId) await store.finishEvent(recoveredEventId, "posted");
+          }
+        } catch {
+          try {
+            await store.withGroupLock(event.source.groupId, async () => {
+              const state = await store.loadState(event.source.groupId);
+              state.pendingReceipts ??= [];
+              state.pendingReceipts.push({
+                ...response,
+                pendingEventIds: [...new Set([...(response.pendingEventIds ?? []), event.webhookEventId])],
+              });
+              await store.saveState(state);
+            });
+            await store.finishEvent(event.webhookEventId, "reply_pending", "line_reply_failed");
+          } catch (error) {
+            await store.finishEvent(event.webhookEventId, "failed_retryable", classifyError(error));
+          }
+        }
+      };
+      const prepareLockFreeReply = async (
+        event: LineEvent & { source: { groupId: string; userId: string; type: "group" } },
+        command: string,
+        snapshot: GroupState,
+      ): Promise<ReplyMessage | undefined> => {
+        if (snapshot.suspended) return undefined;
+        await cacheMemberNames(snapshot, event.source.groupId, env, providers);
+        const response = await processText(event, command, snapshot, providers, env, store);
+        return store.withGroupLock(event.source.groupId, async () => {
+          const state = await store.loadState(event.source.groupId);
+          state.memberNames = { ...(state.memberNames ?? {}), ...(snapshot.memberNames ?? {}) };
+          state.pendingReceipts ??= [];
+          attachPendingReceipts(response, state);
+          await store.saveState(state);
+          return response;
+        });
+      };
+      const processEvents = async (): Promise<void> => {
       for (const event of webhook.events) {
         if (event.source?.type === "group" && event.source.groupId === env.ALLOWED_GROUP_ID && (event.type === "memberJoined" || event.type === "memberLeft")) {
           const state = await store.loadState(event.source.groupId);
@@ -439,66 +769,85 @@ export function createWorker(dependencies: { store: Store; providers: Providers 
           userId: event.source.userId,
           timestamp: event.timestamp,
           status: "received",
-          raw: body,
           expiresAt: event.timestamp + 30 * 86_400_000,
         });
         if (!inserted) continue;
         try {
           if (event.type === "message" && event.message?.type === "text" && event.message.text && event.replyToken) {
-            await store.withGroupLock(event.source.groupId, async () => {
+            const messageText = event.message.text;
+            const preflightState = await store.loadState(event.source.groupId);
+            if (LOCK_FREE_COMMANDS.has(messageText)) {
+              const response = await prepareLockFreeReply(event, messageText, preflightState);
+              if (response) await deliverReply(event, response);
+              else await store.finishEvent(event.webhookEventId, "failed_final", "group_suspended");
+              continue;
+            }
+            await cacheMemberNames(preflightState, event.source.groupId, env, providers);
+            const preparedParse = needsGemini(messageText) && !preflightState.suspended
+              ? await prepareParse(messageText, preflightState, event.timestamp, providers, env)
+              : undefined;
+            const response = await store.withGroupLock(event.source.groupId, async () => {
               const state = await store.loadState(event.source.groupId);
+              state.memberNames = { ...(state.memberNames ?? {}), ...(preflightState.memberNames ?? {}) };
               if (state.suspended) {
-                await store.finishEvent(event.webhookEventId, "failed_final");
-                return;
+                return undefined;
               }
-              const response = await processText(event, event.message?.text ?? "", state, providers, env);
-              if (response && state.pendingReceipts.length > 0) {
-                response.text = `${state.pendingReceipts.map((item) => item.text).join("\n---\n")}\n---\n${response.text}`;
-                state.pendingReceipts = [];
-              }
+              const response = await processText(event, messageText, state, providers, env, store, preparedParse);
+              attachPendingReceipts(response, state);
               await store.saveState(state);
-              if (response) {
-                try {
-                  await providers.reply(event.replyToken ?? "", response);
-                } catch {
-                  state.pendingReceipts.push(response);
-                  await store.saveState(state);
-                  await store.finishEvent(event.webhookEventId, "reply_pending");
-                  return;
-                }
-              }
-              await store.finishEvent(event.webhookEventId, "posted");
+              return response;
             });
+            if (response) await deliverReply(event, response);
+            else await store.finishEvent(event.webhookEventId, "failed_final", "group_suspended");
           } else if (event.type === "postback" && event.postback?.data && event.replyToken) {
             const params = new URLSearchParams(event.postback.data);
             const action = params.get("action");
             const id = params.get("id");
-            const command = action && id
-              ? action === "edit" ? `編輯 ${id}`
+            const command = action === "chart" || action === "detail" || action === "menu"
+              ? params.get("value") ?? ""
+              : action && id
+                ? action === "edit" ? `編輯 ${id}`
                 : action === "delete" ? `刪除 ${id}`
                   : action === "confirm" ? `確認 ${id}`
-                    : action === "category" ? `分類 ${id} ${params.get("value") ?? ""}`
+                    : action === "cancel" ? `取消 ${id}`
+                      : action === "category" ? `分類 ${id} ${params.get("value") ?? ""}`
                       : action === "contribution" ? `存入選擇 ${id} ${params.get("value") ?? ""}`
-                        : action === "refund" ? `退款準備 ${id}`
                       : ""
-              : "";
-            await store.withGroupLock(event.source.groupId, async () => {
+                : "";
+            const preflightState = await store.loadState(event.source.groupId);
+            if (LOCK_FREE_COMMANDS.has(command)) {
+              const response = await prepareLockFreeReply(event, command, preflightState);
+              if (response) await deliverReply(event, response);
+              else await store.finishEvent(event.webhookEventId, "failed_final", "invalid_command");
+              continue;
+            }
+            await cacheMemberNames(preflightState, event.source.groupId, env, providers);
+            const response = await store.withGroupLock(event.source.groupId, async () => {
               const state = await store.loadState(event.source.groupId);
-              const response = await processText(event, command, state, providers, env);
+              state.memberNames = { ...(state.memberNames ?? {}), ...(preflightState.memberNames ?? {}) };
+              const response = await processText(event, command, state, providers, env, store);
+              attachPendingReceipts(response, state);
               await store.saveState(state);
-              if (response) await providers.reply(event.replyToken ?? "", response);
-              await store.finishEvent(event.webhookEventId, "posted");
+              return response;
             });
+            if (response) await deliverReply(event, response);
+            else await store.finishEvent(event.webhookEventId, "failed_final", "invalid_command");
           } else if (event.type === "message" && event.replyToken) {
             await providers.reply(event.replyToken, { text: "目前只支援文字記帳。" });
             await store.finishEvent(event.webhookEventId, "posted");
           } else {
-            await store.finishEvent(event.webhookEventId, "failed_final");
+            await store.finishEvent(event.webhookEventId, "failed_final", "unsupported_event");
           }
-        } catch {
-          await store.finishEvent(event.webhookEventId, "failed_retryable");
+        } catch (error) {
+          await store.finishEvent(event.webhookEventId, "failed_retryable", classifyError(error));
         }
       }
+      };
+      if (context) {
+        context.waitUntil(processEvents());
+        return new Response("OK");
+      }
+      await processEvents();
       return new Response("OK");
     },
     async scheduled(event, env) {
@@ -518,28 +867,18 @@ export function createWorker(dependencies: { store: Store; providers: Providers 
           fundMonth.incomplete = ![...allowedUsers(env)].every((userId) => fundMonth.confirmations[userId]);
           fundMonth.closedAt = event.scheduledTime;
           fundMonth.closingBalance = balance(state, `${month}-31`);
-          const csv = csvForMonth(state, month);
-          let csvStatus = "已上傳";
-          try {
-            state.driveFiles[month] = await uploadCsvWithRetry(providers, month, csv, state.driveFiles[month]);
-            state.driveFailures = state.driveFailures.filter((candidate) => candidate !== month);
-          } catch {
-            csvStatus = "失敗，可輸入「重新上傳」";
-            if (!state.driveFailures.includes(month)) state.driveFailures.push(month);
-          }
           state.sentJobs.push(jobId);
           if (await providers.pushAllowance() >= 2) {
             const entries = activeEntries(state).filter((entry) => monthOf(entry.date) === month);
             const contributions = entries.filter((entry) => entry.type === "contribution").reduce((sum, entry) => sum + entry.amount, 0);
             const topups = entries.filter((entry) => entry.type === "topup").reduce((sum, entry) => sum + entry.amount, 0);
-            const otherIncome = entries.filter((entry) => entry.type === "income").reduce((sum, entry) => sum + entry.amount, 0);
-            const refunds = entries.filter((entry) => entry.type === "refund").reduce((sum, entry) => sum + entry.amount, 0);
+            const otherIncome = entries.filter((entry) => entry.type === "income" || entry.type === "refund").reduce((sum, entry) => sum + entry.amount, 0);
             const expenses = entries.filter((entry) => entry.type === "expense").reduce((sum, entry) => sum + entry.amount, 0);
             const totals = categoryTotals(state, month);
             const largestIndex = totals.reduce((best, value, index) => value > (totals[best] ?? -Infinity) ? index : best, 0);
             const largestCategory = Object.keys(CATEGORIES)[largestIndex] ?? "無";
             const missing = [...allowedUsers(env)].filter((userId) => !fundMonth.confirmations[userId]);
-            await providers.push(env.ALLOWED_GROUP_ID, { text: `${month} 已結算\n共同基金存入：${money(contributions)}\n臨時補入：${money(topups)}\n其他收入：${money(otherIncome)}\n退款：${money(refunds)}\n支出：${money(expenses)}\n最大支出分類：${largestCategory}\n月底結餘：${money(fundMonth.closingBalance)}\n下月期初結轉：${money(fundMonth.closingBalance)}\nCSV：${csvStatus}${missing.length ? `\n存入未完成：${missing.join("、")}` : "\n存入狀態：已完成"}` });
+            await providers.push(env.ALLOWED_GROUP_ID, { text: `${month} 已結算\n共同基金存入：${money(contributions)}\n臨時補入：${money(topups)}\n其他收入：${money(otherIncome)}\n支出：${money(expenses)}\n最大支出分類：${largestCategory}\n月底結餘：${money(fundMonth.closingBalance)}\n下月期初結轉：${money(fundMonth.closingBalance)}\nCSV：可從「明細」下載${missing.length ? `\n存入未完成：${missing.join("、")}` : "\n存入狀態：已完成"}` });
           }
         }
       } else if ((day === 1 || day === 3) && hour === 9 && minute === 0) {

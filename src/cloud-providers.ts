@@ -2,22 +2,52 @@ import { CATEGORIES } from "./domain";
 import { lineSignature } from "./security";
 import type { ChartData, CloudEnv, ParseContext, ParseResult, Providers, ReplyMessage } from "./types";
 
+const CATEGORY_HINTS: Array<{ keywords: string[]; majorCategory: string; smallCategory: string }> = [
+  { keywords: ["風倍清", "衛生紙", "洗衣精", "洗碗精", "清潔劑", "垃圾袋", "牙膏", "牙刷", "洗髮精", "沐浴乳"], majorCategory: "購物", smallCategory: "日用品" },
+  { keywords: ["電扇", "風扇", "冰箱", "冷氣", "電視", "吹風機", "除濕機", "吸塵器"], majorCategory: "購物", smallCategory: "家電" },
+];
+
+function normalizeKnownProduct(text: string, result: ParseResult): ParseResult {
+  if (result.intent !== "transactions" || result.transactions.length !== 1) return result;
+  const transaction = result.transactions[0];
+  if (!transaction || transaction.type !== "expense" || (transaction.majorCategory && transaction.smallCategory)) return result;
+  const hint = CATEGORY_HINTS.find((candidate) => candidate.keywords.some((keyword) => text.includes(keyword)));
+  if (!hint) return result;
+  const note = transaction.note?.trim() || text.replace(/\s*\d[\d,]*\s*元?\s*$/, "").trim();
+  return {
+    intent: "transactions",
+    transactions: [{ ...transaction, majorCategory: hint.majorCategory, smallCategory: hint.smallCategory, ...(note ? { note } : {}) }],
+    ambiguous: false,
+  };
+}
+
 function lineMessage(message: ReplyMessage): Record<string, unknown> {
   if (!message.flex) return { type: "text", text: message.text };
-  const suppliedContents = (message.flex.type === "bubble" || message.flex.type === "carousel") ? message.flex : undefined;
+  const suppliedContents = message.flex.type === "bubble"
+    ? (message.flex.body || message.flex.hero || message.flex.header || message.flex.footer ? message.flex : undefined)
+    : message.flex.type === "carousel" && Array.isArray(message.flex.contents) && message.flex.contents.length > 0
+      ? message.flex
+      : undefined;
+  if (!suppliedContents) return { type: "text", text: message.text };
   return {
     type: "flex",
     altText: message.text.slice(0, 400),
-    contents: suppliedContents ?? {
-      type: "bubble",
-      body: { type: "box", layout: "vertical", contents: [{ type: "text", text: message.text, wrap: true, size: "sm" }] },
-    },
+    contents: suppliedContents,
   };
 }
 
 async function jsonRequest(url: string, init: RequestInit): Promise<Record<string, unknown>> {
   const response = await fetch(url, init);
-  if (!response.ok) throw new Error(`Provider request failed: ${response.status}`);
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const payload = await response.json() as { error?: { message?: string; status?: string } };
+      detail = [payload.error?.status, payload.error?.message].filter(Boolean).join(": ");
+    } catch {
+      // Some providers return an empty or non-JSON error body.
+    }
+    throw new Error(`Provider request failed: ${response.status}${detail ? ` (${detail})` : ""}`);
+  }
   return await response.json() as Record<string, unknown>;
 }
 
@@ -27,6 +57,7 @@ export class CloudProviders implements Providers {
   async reply(token: string, message: ReplyMessage): Promise<void> {
     await jsonRequest("https://api.line.me/v2/bot/message/reply", {
       method: "POST",
+      signal: AbortSignal.timeout(5_000),
       headers: { authorization: `Bearer ${this.env.LINE_CHANNEL_ACCESS_TOKEN}`, "content-type": "application/json" },
       body: JSON.stringify({ replyToken: token, messages: [lineMessage(message)] }),
     });
@@ -40,6 +71,13 @@ export class CloudProviders implements Providers {
     });
   }
 
+  async memberName(groupId: string, userId: string): Promise<string | undefined> {
+    const profile = await jsonRequest(`https://api.line.me/v2/bot/group/${encodeURIComponent(groupId)}/member/${encodeURIComponent(userId)}`, {
+      headers: { authorization: `Bearer ${this.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+    });
+    return typeof profile.displayName === "string" && profile.displayName.trim() ? profile.displayName.trim() : undefined;
+  }
+
   async pushAllowance(): Promise<number> {
     const [quota, consumption] = await Promise.all([
       jsonRequest("https://api.line.me/v2/bot/message/quota", { headers: { authorization: `Bearer ${this.env.LINE_CHANNEL_ACCESS_TOKEN}` } }),
@@ -51,9 +89,15 @@ export class CloudProviders implements Providers {
 
   async parse(text: string, context: ParseContext): Promise<ParseResult> {
     if (!this.env.GEMINI_API_KEY) throw new Error("Missing Gemini key");
-    const model = this.env.GEMINI_MODEL ?? "gemini-2.5-flash-lite";
+    const model = this.env.GEMINI_MODEL ?? "gemini-3.5-flash-lite";
     const prompt = [
       "你是共同基金記帳解析器。只輸出符合 schema 的 JSON。不要猜測不明確欄位。",
+      "使用者表示當月／這個月存入某金額時，intent=transactions，type=contribution。",
+      "使用者明確表示本月不存或存入 0 時，intent=zero_contribution，不建立 transactions。",
+      "日常消費的 type=expense；額外補入的 type=topup；不支援退款，退款相關輸入必須回傳 intent=unknown。",
+      "飲食若明確出現早餐、午餐或晚餐，smallCategory 必須使用對應時段；無法判斷時標記 ambiguous，不可猜測。",
+      "常見商品分類：風倍清、衛生紙、洗衣精、洗碗精、清潔劑、垃圾袋、牙膏、洗髮精屬於購物／日用品；電扇、冰箱、冷氣、吹風機、除濕機、吸塵器屬於購物／家電。",
+      "商品或品牌能由上述例子或一般常識唯一對應既有分類時，應填入 majorCategory、smallCategory、note，且 ambiguous=false；只有確實存在多個合理分類時才標記 ambiguous。",
       `事件日期：${context.eventDate}；幣別只允許 TWD 整數；未寫日期使用事件日期；未來日期無效。`,
       `分類：${JSON.stringify(CATEGORIES)}`,
       `輸入：${text}`,
@@ -63,37 +107,41 @@ export class CloudProviders implements Providers {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json" },
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseJsonSchema: {
+            type: "object",
+            required: ["intent"],
+            properties: {
+              intent: { type: "string", enum: ["transactions", "zero_contribution", "query", "unknown"] },
+              transactions: {
+                type: "array",
+                items: {
+                  type: "object",
+                  required: ["type", "amount", "date"],
+                  properties: {
+                    type: { type: "string", enum: ["expense", "contribution", "topup", "income"] },
+                    amount: { type: "integer", minimum: 1 },
+                    date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+                    majorCategory: { type: "string", enum: Object.keys(CATEGORIES) },
+                    smallCategory: { type: "string", enum: Object.values(CATEGORIES).flat() },
+                    note: { type: "string" },
+                    linkedTransactionId: { type: "string" },
+                  },
+                },
+              },
+              ambiguous: { type: "boolean" },
+              categoryChoices: { type: "array", items: { type: "string", enum: Object.values(CATEGORIES).flat() } },
+              query: { type: "string", enum: ["balance", "recent", "month_detail", "unknown"] },
+            },
+          },
+        },
       }),
     });
     const candidates = result.candidates as Array<{ content?: { parts?: Array<{ text?: string }> } }> | undefined;
     const output = candidates?.[0]?.content?.parts?.[0]?.text;
     if (!output) return { intent: "unknown" };
-    return JSON.parse(output) as ParseResult;
-  }
-
-  private async driveAccessToken(): Promise<string> {
-    if (!this.env.GOOGLE_CLIENT_ID || !this.env.GOOGLE_CLIENT_SECRET || !this.env.GOOGLE_REFRESH_TOKEN) throw new Error("Missing Google OAuth secrets");
-    const response = await jsonRequest("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ client_id: this.env.GOOGLE_CLIENT_ID, client_secret: this.env.GOOGLE_CLIENT_SECRET, refresh_token: this.env.GOOGLE_REFRESH_TOKEN, grant_type: "refresh_token" }),
-    });
-    return String(response.access_token);
-  }
-
-  async uploadCsv(month: string, csv: string, existingFileId?: string): Promise<string> {
-    const token = await this.driveAccessToken();
-    if (existingFileId) {
-      const response = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(existingFileId)}?uploadType=media`, { method: "PATCH", headers: { authorization: `Bearer ${token}`, "content-type": "text/csv; charset=utf-8" }, body: csv });
-      if (!response.ok) throw new Error(`Drive update failed: ${response.status}`);
-      return existingFileId;
-    }
-    const boundary = `codex-${crypto.randomUUID()}`;
-    const metadata = JSON.stringify({ name: `共同基金_${month}.csv`, mimeType: "text/csv", ...(this.env.GOOGLE_DRIVE_FOLDER_ID ? { parents: [this.env.GOOGLE_DRIVE_FOLDER_ID] } : {}) });
-    const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n--${boundary}\r\nContent-Type: text/csv; charset=UTF-8\r\n\r\n${csv}\r\n--${boundary}--`;
-    const response = await jsonRequest("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": `multipart/related; boundary=${boundary}` }, body });
-    return String(response.id);
+    return normalizeKnownProduct(text, JSON.parse(output) as ParseResult);
   }
 
   async chart(kind: "month" | "monthly-trend" | "category-trend", data: ChartData): Promise<string> {
@@ -116,7 +164,7 @@ export class CloudProviders implements Providers {
     if (expected !== signature) return new Response("Not found", { status: 404 });
     const row = await this.env.DB.prepare("SELECT chart_json, expires_at FROM chart_tokens WHERE token = ?").bind(token).first<{ chart_json: string; expires_at: number }>();
     if (!row || row.expires_at !== expiresAt) return new Response("Not found", { status: 404 });
-    const response = await fetch("https://quickchart.io/chart", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ width: 900, height: 600, format: "png", backgroundColor: "white", chart: JSON.parse(row.chart_json) }) });
+    const response = await fetch("https://quickchart.io/chart", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ width: 720, height: 900, devicePixelRatio: 2, format: "png", backgroundColor: "white", chart: JSON.parse(row.chart_json) }) });
     if (!response.ok) return new Response("Chart unavailable", { status: 503 });
     return new Response(response.body, { headers: { "content-type": "image/png", "cache-control": "private, max-age=3600" } });
   }
@@ -127,6 +175,15 @@ function chartConfig(kind: string, data: ChartData): Record<string, unknown> {
   return {
     type,
     data: { labels: data.labels, datasets: data.datasets.map((dataset, index) => ({ label: dataset.label, data: dataset.values, backgroundColor: ["#FF8A65", "#4DB6AC", "#7986CB", "#FFD54F", "#BA68C8"][index % 5] })) },
-    options: { responsive: false, legend: { display: kind !== "month" }, scales: { yAxes: [{ stacked: kind === "category-trend", ticks: { beginAtZero: true } }], xAxes: [{ stacked: kind === "category-trend", ticks: { beginAtZero: true } }] } },
+    options: {
+      responsive: false,
+      layout: { padding: { top: 28, right: 28, bottom: 20, left: 20 } },
+      legend: { display: kind !== "month", position: "top", labels: { fontSize: 20, padding: 18, boxWidth: 24 } },
+      plugins: { datalabels: { display: true, anchor: "end", align: "end", color: "#333333", font: { size: 17, weight: "bold" } } },
+      scales: {
+        yAxes: [{ stacked: kind === "category-trend", ticks: { beginAtZero: true, fontSize: 17, padding: 8 } }],
+        xAxes: [{ stacked: kind === "category-trend", ticks: { beginAtZero: true, fontSize: 17, padding: 8 } }],
+      },
+    },
   };
 }

@@ -1,7 +1,7 @@
 import type { FundMonth, GroupState, LedgerEntry, ParsedTransaction } from "./types";
 
 export const CATEGORIES = {
-  "飲食": ["正餐", "飲料", "甜點", "零食"],
+  "飲食": ["早餐", "午餐", "晚餐", "飲料", "甜點", "零食"],
   "生活": ["房貸", "水電瓦斯", "網路", "修繕", "管理費", "停車費"],
   "交通": ["計程車", "汽車", "機車", "高鐵", "火車", "捷運"],
   "娛樂": ["電影", "影音", "門票", "聚會", "旅遊"],
@@ -9,7 +9,7 @@ export const CATEGORIES = {
 } as const;
 
 export function emptyState(groupId: string): GroupState {
-  return { groupId, sequence: 0, ledger: [], months: {}, pending: [], thresholdBands: {}, suspended: false, outsiderIds: [], geminiUsage: {}, sentJobs: [], pendingReceipts: [], driveFiles: {}, driveFailures: [] };
+  return { groupId, sequence: 0, ledger: [], months: {}, pending: [], thresholdBands: {}, suspended: false, outsiderIds: [], memberNames: {}, geminiUsage: {}, sentJobs: [], pendingReceipts: [] };
 }
 
 export function monthOf(date: string): string {
@@ -21,8 +21,9 @@ export function eventDate(timestamp: number): string {
 }
 
 export function validTransaction(transaction: ParsedTransaction, today: string): boolean {
+  if (transaction.type === "refund") return false;
   if (!Number.isInteger(transaction.amount) || transaction.amount <= 0 || transaction.date > today || !/^\d{4}-\d{2}-\d{2}$/.test(transaction.date)) return false;
-  if (transaction.type === "expense" || (transaction.type === "refund" && !transaction.linkedTransactionId)) {
+  if (transaction.type === "expense") {
     const major = transaction.majorCategory as keyof typeof CATEGORIES;
     return Boolean(major && transaction.smallCategory && CATEGORIES[major]?.includes(transaction.smallCategory as never));
   }

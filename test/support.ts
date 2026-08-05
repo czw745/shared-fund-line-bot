@@ -1,10 +1,11 @@
 import { lineSignature } from "../src/security";
 import { emptyState } from "../src/domain";
-import type { AppEnv, ChartData, EventRecord, GroupState, ParseContext, ParseResult, Providers, ReplyMessage, Store } from "../src/types";
+import type { AppEnv, ChartData, ErrorSummary, EventRecord, GroupState, ParseContext, ParseResult, Providers, ReplyMessage, Store } from "../src/types";
 
 export class MemoryStore implements Store {
   readonly events: EventRecord[] = [];
   readonly states = new Map<string, GroupState>();
+  readonly csvExports = new Map<string, { csv: string; filename: string; expiresAt: number }>();
   private readonly locks = new Map<string, Promise<void>>();
 
   async beginEvent(record: EventRecord): Promise<boolean> {
@@ -13,9 +14,31 @@ export class MemoryStore implements Store {
     return true;
   }
 
-  async finishEvent(id: string, status: EventRecord["status"]): Promise<void> {
+  async finishEvent(id: string, status: EventRecord["status"], errorCode?: string): Promise<void> {
     const event = this.events.find((candidate) => candidate.id === id);
-    if (event) event.status = status;
+    if (event) {
+      event.status = status;
+      if (errorCode) event.errorCode = errorCode;
+      else delete event.errorCode;
+    }
+  }
+
+  async errorSummary(groupId: string, sinceTimestamp: number): Promise<ErrorSummary> {
+    const matching = this.events.filter((event) => event.groupId === groupId
+      && event.timestamp >= sinceTimestamp
+      && (event.status === "failed_retryable" || event.status === "reply_pending")
+      && event.errorCode);
+    const byCode: Record<string, number> = {};
+    for (const event of matching) byCode[event.errorCode!] = (byCode[event.errorCode!] ?? 0) + 1;
+    return { total: matching.length, byCode };
+  }
+
+  async saveCsvExport(token: string, csv: string, filename: string, expiresAt: number): Promise<void> {
+    this.csvExports.set(token, { csv, filename, expiresAt });
+  }
+
+  async loadCsvExport(token: string): Promise<{ csv: string; filename: string; expiresAt: number } | undefined> {
+    return this.csvExports.get(token);
   }
 
   async loadState(groupId: string): Promise<GroupState> {
@@ -30,6 +53,7 @@ export class MemoryStore implements Store {
     for (let index = this.events.length - 1; index >= 0; index -= 1) {
       if ((this.events[index]?.expiresAt ?? Infinity) < beforeTimestamp) this.events.splice(index, 1);
     }
+    for (const [token, item] of this.csvExports) if (item.expiresAt < beforeTimestamp) this.csvExports.delete(token);
   }
 
   async withGroupLock<T>(groupId: string, action: () => Promise<T>): Promise<T> {
@@ -62,8 +86,9 @@ export class TestProviders implements Providers {
   readonly pushes: Array<ReplyMessage & { groupId: string }> = [];
   readonly parses: ParseResult[] = [];
   readonly geminiInputs: string[] = [];
-  readonly uploads: Array<{ month: string; csv: string; existingFileId?: string }> = [];
   readonly charts: Array<{ kind: string; data: ChartData }> = [];
+  readonly memberNameCalls: Array<{ groupId: string; userId: string }> = [];
+  readonly memberNames: Record<string, string> = { SPOUSE_A: "卡村", SPOUSE_B: "Tiffany" };
   allowance = 200;
   parseFailures = 0;
 
@@ -73,6 +98,11 @@ export class TestProviders implements Providers {
 
   async push(groupId: string, message: ReplyMessage): Promise<void> {
     this.pushes.push({ ...message, groupId });
+  }
+
+  async memberName(groupId: string, userId: string): Promise<string | undefined> {
+    this.memberNameCalls.push({ groupId, userId });
+    return this.memberNames[userId];
   }
 
 
@@ -85,11 +115,6 @@ export class TestProviders implements Providers {
     return this.parses.shift() ?? { intent: "unknown" };
   }
 
-
-  async uploadCsv(month: string, csv: string, existingFileId?: string): Promise<string> {
-    this.uploads.push(existingFileId ? { month, csv, existingFileId } : { month, csv });
-    return existingFileId ?? `drive-${month}`;
-  }
 
   async chart(kind: "month" | "monthly-trend" | "category-trend", data: ChartData): Promise<string> {
     this.charts.push({ kind, data });
