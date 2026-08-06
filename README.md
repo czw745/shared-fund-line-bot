@@ -82,9 +82,20 @@ npm test
 - QuickChart 失敗時退回文字統計，不使用付費 renderer
 - webhook 稽核表不保存完整 LINE 訊息內容
 
+### 部署後確認不會自動計費
+
+1. Cloudflare Dashboard → **Billing → Subscriptions**：確認只有 Workers Free，沒有 Workers Paid／Standard subscription。
+2. Cloudflare Dashboard → **Workers & Pages → shared-fund-line-bot → Metrics**：確認請求量仍在 Free 每日額度內。
+3. Cloudflare Dashboard → **Storage & databases → D1 → shared-fund-ledger → Metrics**：確認 rows read、rows written 與 storage 未達 Free 上限。
+4. Google Cloud Console → **Billing**：確認 Gemini API 所在專案未連結 Billing account。
+5. LINE Official Account Manager → **設定 → 月費方案／用量**：確認使用輕用量方案且未啟用加購訊息。
+
+本專案不含任何自動升級、加購或付費 fallback 程式；是否維持免費仍以以上控制台設定為準。
+
 ### 額度耗盡時的行為
 
-- Cloudflare Workers／D1 免費額度耗盡：請求失敗或暫時無法使用，不自動升級付費資源。
+- Workers Free 每日 100,000 requests 用完：Cloudflare 對 webhook 回傳 **Error 1027**；LINE 不會收到 Bot 回覆，也不會新增帳本，額度於 00:00 UTC 重設。
+- D1 每日 rows read／written 額度用完：D1 query 回傳 quota error；LINE 訊息不入帳且 Bot 無回覆，直到 00:00 UTC 重設。D1 storage 滿時，新增或修改資料會失敗，但既有資料不會自動刪除。
 - Gemini 達每日 100 次內部上限：自然語言記帳停止，`餘額`、`明細`、`圖表`與`系統狀態`仍可用。
 - LINE Reply token 失效：不改用可能計費的 Push，已完成收據留到下一次互動補送。
 - LINE Push 月額度不足：跳過存入提醒與關帳通知，帳本關帳與結轉仍正常完成。
