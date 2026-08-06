@@ -9,7 +9,7 @@
 - 單筆 NT$10,000 以上須確認，避免高額誤入帳
 - 固定大小分類、低餘額提醒與跨月結轉
 - 最近紀錄、本月明細、交易編輯／刪除及記錄者名稱
-- 本月分析、每月趨勢與分類趨勢
+- Flex 本月分類排行、每月趨勢與分類趨勢圖
 - 10 分鐘有效的簽章 CSV 下載連結，不需要 Google OAuth
 - Gemini、LINE Push 與最近 24 小時系統健康度查詢
 
@@ -41,11 +41,11 @@ npm test
 
 ## 部署
 
-1. 建立 Cloudflare Free 帳號，保持 Workers Free plan。
+1. 建立 Cloudflare Free 帳號，保持 Workers Free plan，不綁定或升級 Workers Paid。
 2. 建立 D1：`npx wrangler d1 create shared-fund-ledger`，將 database ID 填入 `wrangler.toml`。
 3. 套用 migration：`npx wrangler d1 migrations apply shared-fund-ledger --remote`。
-4. 建立 LINE OA Messaging API channel，允許加入群組並開啟 webhook redelivery。
-5. 建立未連結 Billing 的 Gemini API key。
+4. 建立 LINE OA 輕用量方案的 Messaging API channel，關閉加購訊息，允許加入群組並開啟 webhook redelivery。
+5. 建立未連結 Billing、未申請付費 quota increase 的 Gemini API key。
 6. 依 `.dev.vars.example` 用 `npx wrangler secret put <NAME>` 設定 secrets。
 7. `CHART_SIGNING_SECRET` 使用至少 32 bytes 隨機值；`PUBLIC_BASE_URL` 設為 Worker HTTPS origin。
 8. 執行 `npm run deploy`，把 `<worker-origin>/webhook` 設為 LINE webhook URL。
@@ -82,6 +82,14 @@ npm test
 - QuickChart 失敗時退回文字統計，不使用付費 renderer
 - webhook 稽核表不保存完整 LINE 訊息內容
 
+### 額度耗盡時的行為
+
+- Cloudflare Workers／D1 免費額度耗盡：請求失敗或暫時無法使用，不自動升級付費資源。
+- Gemini 達每日 100 次內部上限：自然語言記帳停止，`餘額`、`明細`、`圖表`與`系統狀態`仍可用。
+- LINE Reply token 失效：不改用可能計費的 Push，已完成收據留到下一次互動補送。
+- LINE Push 月額度不足：跳過存入提醒與關帳通知，帳本關帳與結轉仍正常完成。
+- QuickChart 無法使用：回覆文字／Flex 統計，不切換付費圖表服務。
+
 ## 驗證
 
 ```sh
@@ -89,4 +97,4 @@ npm run typecheck
 npm test
 ```
 
-正式環境 smoke test：`說明` → 兩人存入 → 一般與高額支出 → `餘額` → `明細` → 修改／刪除 → CSV 下載 → 三種圖表 → `系統狀態`。
+正式環境 smoke test：`說明` → 兩人存入 → 一般與高額支出 → `餘額` → `明細` → 修改／刪除 → CSV 下載 → 三種分析功能 → `系統狀態`。

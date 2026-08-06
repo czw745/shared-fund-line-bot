@@ -70,7 +70,7 @@ MVP 必須在正常使用下維持零費用，且任何免費額度耗盡時只�
 53. As a spouse, I want to ask `說明`, so that I can discover available commands and natural-language examples.
 54. As a spouse, I want exact commands processed without Gemini, so that command usage does not consume the AI quota.
 55. As a spouse, I want fuzzy queries interpreted by Gemini, so that I can ask questions such as how much money remains in natural language.
-56. As a spouse, I want `本月分析` to show category spending and the top small categories, so that I understand this month's spending mix.
+56. As a spouse, I want `本月分析` to show a readable Flex ranking of major-category spending, so that I understand this month's spending mix on mobile.
 57. As a spouse, I want `每月趨勢` to compare contributions, expenses, and closing balances over six months, so that I can see overall movement.
 58. As a spouse, I want `分類趨勢` to compare major-category spending over six months, so that I can see which kinds of spending are changing.
 59. As a spouse, I want charts rendered in a consistent mobile-friendly style, so that repeated reports are easy to compare.
@@ -209,7 +209,7 @@ MVP 必須在正常使用下維持零費用，且任何免費額度耗盡時只�
 
 ### Reports and charts
 
-- `本月分析` renders a horizontal bar chart of major-category net spending and lists the top three small categories.
+- `本月分析` renders a Flex ranking of non-zero major-category net spending with amount and percentage; it does not generate an image.
 - `每月趨勢` renders six months of contribution and expense bars with a closing-balance line.
 - `分類趨勢` renders six months of major-category net spending as stacked bars.
 - Charts use fixed mobile dimensions, typography, colors, title placement, category ordering, currency formatting, and empty-state behavior.
