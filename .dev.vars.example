@@ -1,0 +1,9 @@
+LINE_CHANNEL_SECRET=
+LINE_CHANNEL_ACCESS_TOKEN=
+ALLOWED_GROUP_ID=
+ALLOWED_USER_IDS=Uxxxxxxxx,Uyyyyyyyy
+MEMBER_NAME_OVERRIDES={"Uxxxxxxxx":"成員甲","Uyyyyyyyy":"成員乙"}
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash-lite
+CHART_SIGNING_SECRET=
+PUBLIC_BASE_URL=https://shared-fund-line-bot.example.workers.dev

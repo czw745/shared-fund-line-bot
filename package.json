@@ -1,0 +1,27 @@
+{
+  "name": "shared-fund-line-bot",
+  "version": "0.1.0",
+  "description": "Self-hosted LINE bot for a two-member shared fund ledger on Cloudflare Workers and D1.",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/czw745/shared-fund-line-bot.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.27.0"
+  }
+}
