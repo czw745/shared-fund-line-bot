@@ -6,6 +6,7 @@ export const CATEGORIES = {
   "交通": ["計程車", "汽車", "機車", "高鐵", "火車", "捷運"],
   "娛樂": ["電影", "影音", "門票", "聚會", "旅遊"],
   "購物": ["服飾", "3C", "家電", "香菸", "酒水", "玩具", "日用品"],
+  "其他": ["捐贈"],
 } as const;
 
 export function emptyState(groupId: string): GroupState {

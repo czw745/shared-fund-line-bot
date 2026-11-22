@@ -8,6 +8,9 @@ const DETAIL_PAGE_SIZE = 10;
 
 const DIRECT_COMMANDS = new Set(["說明", "圖表", "明細", "系統狀態", "餘額", "最近紀錄", "修改", "本月明細", "下載 CSV", "本月分析", "每月趨勢", "分類趨勢"]);
 const LOCK_FREE_COMMANDS = new Set(DIRECT_COMMANDS);
+const LOCAL_EXPENSE_ALIASES = [
+  { keywords: ["香油錢", "捐款", "奉獻"], majorCategory: "其他", smallCategory: "捐贈" },
+] as const;
 
 function recentMonths(current: string, count: number): string[] {
   const year = Number(current.slice(0, 4));
@@ -53,14 +56,17 @@ function expenseWithCategory(text: string, date: string, majorCategory: string, 
 function parseWithKnownCategory(text: string, date: string): ParseResult | undefined {
   const sources = transactionSources(text, date);
   if (sources?.length !== 1) return undefined;
-  const description = sources[0]?.description;
+  const description = sources[0]!.description;
   const matches = Object.entries(CATEGORIES)
     .flatMap(([majorCategory, smallCategories]) => smallCategories.map((smallCategory) => ({ majorCategory, smallCategory })))
     .filter(({ smallCategory }) => description === smallCategory)
     .sort((left, right) => right.smallCategory.length - left.smallCategory.length);
   const match = matches[0];
-  if (!match || matches.some((candidate) => candidate.smallCategory.length === match.smallCategory.length && candidate.smallCategory !== match.smallCategory)) return undefined;
-  return expenseWithCategory(text, date, match.majorCategory, match.smallCategory);
+  if (match && !matches.some((candidate) => candidate.smallCategory.length === match.smallCategory.length && candidate.smallCategory !== match.smallCategory)) {
+    return expenseWithCategory(text, date, match.majorCategory, match.smallCategory);
+  }
+  const alias = LOCAL_EXPENSE_ALIASES.find((candidate) => candidate.keywords.some((keyword) => description.includes(keyword)));
+  return alias ? expenseWithCategory(text, date, alias.majorCategory, alias.smallCategory) : undefined;
 }
 
 function normalizedKeyword(value: string, categories: string[] = []): string {

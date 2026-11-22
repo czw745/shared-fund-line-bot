@@ -102,6 +102,7 @@ export class CloudProviders implements Providers {
       "備註只保存該筆扣除日期、金額、分類名稱與同義分類詞後的具體品項、店名、品牌、數量或用途，不可混入其他筆內容。不要把分類依據全部刪除。",
       "例：午餐鐵板麵260→飲食／午餐，note=鐵板麵；三哥晚餐240→飲食／晚餐，note=三哥；早餐264→飲食／早餐且無note；停車40→生活／停車費且無note。",
       "例：加油1120→交通／汽車，note=加油（明示機車則分類機車）；甜甜圈95→飲食／甜點，note=甜甜圈；電費、水費、瓦斯費歸生活／水電瓦斯但note各保留細項；uber保留品牌名。停車位或車位可保留以辨識用途。",
+      "香油錢、捐款、奉獻歸其他／捐贈，並保留原始用途作為note。",
       "只有超市或LOPIA超市等店名時不能推定日用品或零食；只有牛肉麵、火鍋等品項時不能推定午餐或晚餐。缺少分類依據時保留描述並標記ambiguous，省略不確定的分類欄位，讓使用者補選或補充內容。",
       "常見商品分類：風倍清、衛生紙、洗衣精、洗碗精、清潔劑、垃圾袋、牙膏、洗髮精屬於購物／日用品；電扇、冰箱、冷氣、吹風機、除濕機、吸塵器屬於購物／家電。",
       "商品或品牌能由上述例子或一般常識唯一對應既有分類時，應填入 majorCategory、smallCategory、note，且 ambiguous=false；只有確實存在多個合理分類時才標記 ambiguous。",
@@ -179,7 +180,7 @@ export class CloudProviders implements Providers {
 function chartConfig(kind: "monthly-trend" | "category-trend", data: ChartData): Record<string, unknown> {
   return {
     type: "bar",
-    data: { labels: data.labels, datasets: data.datasets.map((dataset, index) => ({ label: dataset.label, data: dataset.values, backgroundColor: ["#FF8A65", "#4DB6AC", "#7986CB", "#FFD54F", "#BA68C8"][index % 5] })) },
+    data: { labels: data.labels, datasets: data.datasets.map((dataset, index) => ({ label: dataset.label, data: dataset.values, backgroundColor: ["#FF8A65", "#4DB6AC", "#7986CB", "#FFD54F", "#BA68C8", "#90A4AE"][index % 6] })) },
     options: {
       responsive: false,
       layout: { padding: { top: 28, right: 28, bottom: 20, left: 20 } },

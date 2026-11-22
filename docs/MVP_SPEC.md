@@ -122,6 +122,7 @@ MVP 必須在正常使用下維持零費用，且任何免費額度耗盡時只�
   - 交通：計程車、汽車、機車、高鐵、火車、捷運
   - 娛樂：電影、影音、門票、聚會、旅遊
   - 購物：服飾、3C、家電、香菸、酒水、玩具、日用品
+  - 其他：捐贈（香油錢、捐款、奉獻）
 - Store names, people, brands, and item details belong in `note`, not in the taxonomy.
 - If no category is uniquely defensible, no transaction is posted. The system returns two or three likely small-category buttons for the original sender.
 - The taxonomy is fixed in MVP configuration and cannot be edited through LINE.

@@ -171,6 +171,23 @@ describe("privacy and accounting hardening", () => {
     expect(providers.replies.at(-1)?.text).toContain("支出 NT$600 生活／停車費");
   });
 
+  it("parses incense donations locally without Gemini", async () => {
+    const store = new MemoryStore();
+    const providers = new TestProviders();
+    providers.parseFailures = 1;
+    const worker = createWorker({ store, providers });
+
+    await worker.fetch(await signedLineRequest("11/21 其他 香油錢 1000", {
+      eventId: "incense-donation",
+      timestamp: Date.UTC(2026, 10, 22, 11, 41),
+    }), providers.env);
+
+    const entry = (await store.loadState("GROUP")).ledger[0];
+    expect(entry).toMatchObject({ date: "2026-11-21", amount: 1000, majorCategory: "其他", smallCategory: "捐贈", note: "香油錢" });
+    expect(providers.geminiInputs).toHaveLength(0);
+    expect(providers.replies.at(-1)?.text).toContain("支出 NT$1,000 其他／捐贈｜香油錢");
+  });
+
   it("pushes one sanitized operational alert per error type per hour", async () => {
     const store = new MemoryStore();
     const providers = new TestProviders();
